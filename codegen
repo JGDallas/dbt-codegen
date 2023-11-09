@@ -1,0 +1,307 @@
+
+{% macro test_basic_yaml(dbt_schema, dbt_trans_schema) %}
+    {######################################################}
+    {#Author: Joshua Garza  20231109                      #}
+    {#Purpose:                                            #}
+    {#Generates model yaml for sources of any model.      #}
+    {#Borowing heavily from the codegen dbt package       #}
+    {#HISTORY:                                            #}
+    {#Need to modify this package with parameters for     #}
+    {#model paths as well as improve the loop for sources.#}
+    {######################################################}
+
+    {% set database = "DEV_MART_DB" %}
+    {% set dbt_schema = "EA_OPS" %}
+    {% set model_paths = get_model_paths() %}
+    {% set schema = "FOO" %}
+    {% set my_microcounter = 0 %}
+ 
+    {% for unique_model_path in model_paths | unique %}
+        {% if "mart" in unique_model_path %}
+            {% set schema = dbt_schema %}
+        {% elif "transforms" in unique_model_path%}
+            {% set schema = dbt_trans_schema %}
+        {% endif %}
+       
+        {% if "dbtproject/mart" in unique_model_path %}
+            {% set schema = dbt_schema %}
+            
+            {% set models_to_generate = codegen.get_models(directory=unique_model_path) %}
+
+            {% for model in models_to_generate %}
+                {% set current_model_name = model[0] %}
+                {% set my_model_names = [model] %}
+                { {{ dbt_utils.log_info(model) }} }
+                {###JG###{ codegen.generate_model_yaml(model_names = my_model_names, upstream_descriptions=True) }###JG###}
+                {##{ codegen.generate_model_yaml(model_names = my_model_names) }##}
+                {% set column_comment = get_source_comments(column_info , models_to_generate, my_model_names, unique_model_path, previous_model_name) %}
+                {#JG###{ log("++loop.index0 = " ~ loop.index0 ~ " loop.previtem = " ~ loop.previtem ~ " loop.nextitem = " ~ loop.nextitem | string , info=True) }#JG###}
+            {% endfor %}
+        {% endif %}			
+        {{ dbt_utils.log_info(schema) }}
+    {% endfor %}
+{% endmacro %}
+
+
+{% macro generate_source_jg(database_name, schema_name, source_name, my_model_names) %}
+    {% if execute %}
+    {% set sql %}
+        with "columns" as (
+            select '- name: ' || lower(column_name) || '\n            description: "'|| lower(COMMENT) || '"' || '\n            data type: "'|| lower(data_type) || '"'
+                as column_statement,
+                table_name,
+                column_name,
+                data_type
+            from {{ database_name }}.information_schema.columns
+            where table_schema = '{{ schema_name | upper }}' and table_name not in ('FIVETRAN_AUDIT', 'SCHEMA_MIGRATIONS')
+                and lower(column_name) not in ('_fivetran_deleted', '_fivetran_synced')
+                and lower(table_name) = lower('{{ source_name }}')
+        ),
+        tables as (
+            select table_name,
+            '\n      - name: ' || lower(table_name) || '\n        columns:' || listagg('\n          ' || column_statement ||  '\n') within group ( order by column_name ) as table_desc
+            from "columns"
+            where lower(table_name) = lower('{{ source_name }}')
+            group by table_name
+        )
+        select listagg(table_desc) within group ( order by table_name )
+        from tables
+        where lower(table_name) = lower('{{ source_name }}');
+    {% endset %}
+ 
+    {%- call statement('generator', fetch_result=True) -%}
+        {{ sql }}
+    {%- endcall -%}
+
+        {%- set states=load_result('generator') -%}
+        {%- set states_data=states['data'] -%}
+        {%- set states_status=states['response'] -%}
+        {% set sources_yaml=[] %}
+        {% do sources_yaml.append('version: 2345---GENERATED INSIDE generate_source_jg') %}
+        {% do sources_yaml.append('') %}
+        {% do sources_yaml.append('sources: jg') %}
+        {% do sources_yaml.append('  - name: ' ~ source_name | lower) %}
+        {% do sources_yaml.append('    description: ' ~ COMMENT | lower) %}
+        {% do sources_yaml.append('    database: ' ~ database_name | lower) %}
+        {% do sources_yaml.append('    schema: ' ~ schema_name | lower) %}
+        {##-JG-##% do sources_yaml.append('    loader: fivetran') %##-JG-##}
+        {##-JG-##% do sources_yaml.append('    loaded_at_field: _FIVETRAN_SYNCED') %##-JG-##}
+        {% do sources_yaml.append('    meta:') %}
+        {% do sources_yaml.append('      owner: ""') %}
+        {% do sources_yaml.append('      tags: [""]') %}
+        {% do sources_yaml.append('      subscribers: ["@data-team"]') %}
+        {% do sources_yaml.append('    tables:' ~ states_data[0][0] ) %}
+        {% set joined = sources_yaml | join ('\n') %}
+        {{ log(joined, info=True) }}
+
+        {{ generate_model_yaml_JG(model_names = my_model_names, upstream_descriptions=True, my_table_name = states_data[0][0]  ) }}
+        {% for row in states_data %}
+        {% set my_array = [] %}  {# Initialize an empty list #}
+            {% set table_desc = row[0] %}
+        {% do my_array.append(table_desc) %}
+        {% endfor %}
+
+        {% do return(joined) %}
+    {% endif %}
+
+    select 1 -- dummy SQL for parsing stage
+
+{% endmacro %}
+
+{% macro get_source_comments(columninfo, models,my_model_names, unique_model_path, previous_model_name) %}
+  {% set my_db = "myDB" %}
+  {% set my_schema = "mySchema" %}
+  {% set my_table = "myTable" %}
+  {% set mart_files = [modelname] %}
+  {% set source_comments = {} %}
+  {% set my_array = [] %}
+  {##JG##% set my_source_array_item = "FOO" %##JG##}
+
+    {% for model in my_model_names %}
+        {% set string_model = my_model_names | string -%}
+        {% set my_model = model.split('/')[0] -%}
+        {% set my_unique_model_path = unique_model_path.split('/')[0] -%}
+        {% set my_complete_path = unique_model_path ~ "/" ~ my_model ~ ".sql" -%}
+        {% set sources = [] -%}
+        {% for node in graph.sources.values() -%}
+            {% set last_part_of_path = unique_model_path ~ "/" ~ my_model ~ ".sql" -%}
+            {% set my_string = node.path | string %}
+            {% set my_list = my_string.split('/') %}
+            {% set last_element = my_list[-1] %}
+            
+            {% if last_element in node.path and my_unique_model_path in node.fqn[1] %}
+                {{ log("---Picking a model path last_element = " ~  last_element ~ " my_unique_model_path = " ~ my_unique_model_path , info=True) }}
+                {%- do sources.append(source(node.source_name, node.name)) -%}    
+                select * from (
+                {%- for source in sources %}
+                    {%  if source not in my_array %}
+                        select * from {{ source }} {% if not loop.last %} union all {% endif %}
+                        {#---###---THIS IS THE MAGIC---###---##}
+                        {#---###---SEND {{ database }}, {{ schema }}, {{ table }}---###---##}
+                        {{ log(">>>>FIXIN TO MAKE A ROUNDTRIP TO split_string!!!!!! = " ~ source | string , info=True) }}
+                        {{ split_string( source | string , my_model_names) }}
+                    {% endif %}
+                {% endfor %}
+                    )
+                    {##JG##% set my_source_array_item = NULL %##JG##}
+                    {##JG##% set my_source_array_item = source | string %##JG##}
+                    {% do my_array.append( source(node.source_name, node.name) ) -%}
+                    {{ log("<<<< JUST CAME BACK FROM A ROUNDTRIP TO split_string!!!!!! = " ~ my_array | string , info=True) }}
+            {% endif %}
+        {%- endfor %}
+        
+    {% endfor %}
+  {# Return the dictionary of source comments #} 
+  {{ return(source_comments) }}
+{% endmacro %}
+
+{% macro split_string(fully_qualified_string, my_model_names) %}
+    {% set parts = fully_qualified_string.split('.') %}
+    {% set database = parts[0] %}
+    {% set schema = parts[1] %}
+    {% set table = parts[2] %}
+    {{ database }}, {{ schema }}, {{ table }}
+    {#JG###--Alternate calls depending on desired results--###}
+    {#JG###{ generate_source_jg(database_name = database , schema_name = schema, source_name = table, my_model_names = my_model_names) }#JG###}
+    {{ generate_source_list(database_name = database , schema_name = schema, source_name = table, my_model_names = my_model_names) }}
+{% endmacro %}
+
+
+{% macro generate_source_list(database_name, schema_name, source_name, my_model_names) %}
+    {% if execute %}
+        {% set sql %}
+            select
+                table_name,
+                column_name,
+                coalesce(comment, '') as description,
+                data_type
+            from {{ database_name }}.information_schema.columns
+            where table_schema = '{{ schema_name | upper }}'
+            and table_name not in ('FIVETRAN_AUDIT', 'SCHEMA_MIGRATIONS')
+            and lower(column_name) not in ('_fivetran_deleted', '_fivetran_synced')
+            and lower(table_name) = lower('{{ source_name }}')
+            order by table_name, column_name;
+        {% endset %}
+
+        {%- call statement('generator', fetch_result=True) -%}
+        {{ sql }}
+        {%- endcall -%}
+
+        {#- Retrieve the result set -#}
+        {%- set column_details = load_result('generator')['data'] -%}
+
+        {% set columns_list = [] %}
+
+        {#- Loop through the result set and add the details to the list -#}
+        {% for row in column_details %}
+            {% do columns_list.append({
+                'table_name': row[0],
+                'column_name': row[1],
+                'description': row[2],
+                'data_type': row[3]
+            }) %}
+        {% endfor %}
+        {{ generate_model_yaml_JG(model_names = my_model_names, upstream_descriptions=True, my_table_name = columns_list  ) }}
+    {% endif %}
+{% endmacro %}
+
+
+
+{% macro generate_model_yaml_JG(my_table_name, model_names=[], upstream_descriptions=False ) %}
+    {#JG## This is just a copy of the dbt codegen package where I make several modifications ##JG##}
+
+    {# Create a dictionary from your imported columns for easy lookup #}
+    {% set imported_columns_dict = {} %}
+    {% for column in my_table_name.columns %}
+        {% do imported_columns_dict.update({column.name: column}) %}
+        {##JG##{ log("--imported_columns_dict newly minted here.... " ~ column.name ~ " Description = " ~ column.description ~ ", Data Type: " ~ column.data_type, info=true) }##JG##}
+    {% endfor %}
+
+    {% for column in my_table_name %}
+        {% do imported_columns_dict.update({column.column_name: column}) %}
+    {% endfor %}
+
+    {% set model_yaml=[] %}
+
+    {% do model_yaml.append('version: 2') %}
+    {% do model_yaml.append('') %}
+    {% do model_yaml.append('models :') %}
+
+    {% if model_names is string %}
+        {{ exceptions.raise_compiler_error("The `model_names` argument must always be a list, even if there is only one model.") }}
+    {% else %}
+        {% for model in model_names %}
+            {% do model_yaml.append('  - name: ' ~ model | lower) %}
+            {% do model_yaml.append('    description: ""') %}
+            {% do model_yaml.append('    columns:') %}
+
+            {% set relation=ref(model) %}
+            {%- set columns = adapter.get_columns_in_relation(relation) -%}
+            {% set column_desc_dict =  codegen.build_dict_column_descriptions(model) if upstream_descriptions else {} %}
+            
+
+            {% for column in columns %}
+                {% if column.name in imported_columns_dict %}
+                    {{ log("------------Existing Model Column Information: = " ~ column.name ~ " Description = " ~ column.description ~ ", Data Type: " ~ column.data_type, info=true) }}
+                    {{ log("------------Imported Column Information: = " ~ imported_columns_dict[column.name] , info=true) }}
+                    {{ log("------------Imported Column Information - Description : = " ~ imported_columns_dict[column.name]['description'] , info=true) }}
+                    {% set imported_column = imported_columns_dict[column.name] %}
+                    {% set model_yaml = generate_column_yaml_JG(imported_column, model_yaml, column_desc_dict) %}
+                {% else %}
+                    {{ log("Debug: No imported column data for " ~ column.name, info=true) }}
+                    {# Use the existing model's column information #}
+                    {% set model_yaml = generate_column_yaml_JG(column, model_yaml, column_desc_dict) %}
+                {% endif %}
+            {% endfor %}
+        {% endfor %}
+    {% endif %}
+
+    {% if execute %}
+
+        {% set joined = model_yaml | join ('\n') %}
+        {{ log(joined, info=True) }}
+        {% do return(joined) %}
+
+    {% endif %}
+
+{% endmacro %}
+
+
+{% macro generate_column_yaml_JG(column, model_yaml, column_desc_dict, parent_column_name="") %}
+
+    {% for column_name, column in column_desc_dict.items() %}
+        {% set column_description = column.description %}
+    {% endfor %}
+
+    {% if parent_column_name %}
+        {% set column_name = parent_column_name ~ "." ~ column.name %}
+    {% else %}
+        {% set column_name = column.name %}
+    {% endif %}
+
+
+
+    {% if parent_column_name %}
+        {% set column_name = parent_column_name ~ "." ~ column.name %}
+    {% elif column.name %}
+        {% set column_name = column.name %}
+    {% else %}
+        {% set column_name = column.column_name | default('default_column_name') %}
+    {% endif %}
+
+
+    {% set column_description = column.description | default('') %}
+    {##JG##% set column_name = column.column_name | default('') %##JG##}
+    {% do model_yaml.append('      - name: ' ~ column_name | lower ) %}
+    {% do model_yaml.append('        description: "' ~ column_description ~ '"') %}
+    {% do model_yaml.append('') %}
+
+    {% if column.fields|length > 0 %}
+        {% for child_column in column.fields %}
+            {% set model_yaml = generate_column_yaml_JG(child_column, model_yaml, column_desc_dict, parent_column_name=column_name) %}
+        {% endfor %}
+    {% endif %}
+    
+    {% do return(model_yaml) %}
+{% endmacro %}
+
